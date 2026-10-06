@@ -206,6 +206,47 @@ def main(base_url: str) -> None:
         "GET", f"{base_url}/drills/{drill}/snapshots/{cur_v + 100}"
     ))
 
+    # --- 复核员争议日志隔离：批量隔离/恢复（只改变互证资格，不删日志） ---
+    show("批量隔离争议日志 R4/R5", *call(
+        "PUT", f"{base_url}/drills/{drill}/quarantine",
+        {"record_nos": ["R4", "R5"]},
+    ))
+
+    # 重复隔离同一批：无实际状态变化，不推进版本
+    show("重复隔离同一批（重传，版本应不变）", *call(
+        "PUT", f"{base_url}/drills/{drill}/quarantine",
+        {"record_nos": ["R4", "R5"]},
+    ))
+
+    show("查询隔离清单（按记录号升序）", *call(
+        "GET", f"{base_url}/drills/{drill}/quarantine"
+    ))
+
+    # 隔离期间仍可按原接口更正日志，隔离状态保留（R5 仍不参与配对）
+    show("隔离期间更正 R5（隔离状态保留）", *call(
+        "PUT", f"{base_url}/drills/{drill}/logs/R5",
+        {"record_no": "R5", "station": "BH2BBB", "counterpart": "BH1AAA",
+         "time": "2026-10-04T00:00:03+00:00", "band": "40m", "mode": "CW"},
+    ))
+
+    # 隔离记录不得人工锁定
+    show("锁定被隔离的 R4/R5（应 409 lock_record_quarantined）", *call(
+        "PUT", f"{base_url}/drills/{drill}/locks",
+        {"record_a": "R4", "record_b": "R5"},
+    ))
+
+    # 批次含不存在的记录：整批拒绝、状态不变
+    show("隔离批次含不存在记录（应 404 quarantine_record_missing）", *call(
+        "PUT", f"{base_url}/drills/{drill}/quarantine",
+        {"record_nos": ["R4", "NOPE"]},
+    ))
+
+    # 恢复后按当前日志重新求解：R4/R5 以更正后的内容重新参与配对
+    show("批量恢复 R4/R5（按当前日志重新求解）", *call(
+        "POST", f"{base_url}/drills/{drill}/quarantine/restore",
+        {"record_nos": ["R4", "R5"]},
+    ))
+
     show("封存演练", *call("POST", f"{base_url}/drills/{drill}/seal"))
 
     # 封存不产生新快照；封存状态从现态读取（旧快照 sealed 也为 true）

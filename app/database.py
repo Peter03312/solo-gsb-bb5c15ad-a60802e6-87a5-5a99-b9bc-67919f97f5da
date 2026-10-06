@@ -80,9 +80,20 @@ CREATE TABLE IF NOT EXISTS locks (
     FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
 );
 
+-- 复核员争议隔离：只改变互证资格，不删除日志、不改写原字段。
+-- 被隔离记录不参与配对、不进入未配对清单/缺口诊断、不计入台站汇总；
+-- 与人工锁定互斥（锁定成员不得隔离，隔离记录不得锁定/迁移）。
+CREATE TABLE IF NOT EXISTS quarantine (
+    drill_id     TEXT NOT NULL,
+    record_no    TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (drill_id, record_no),
+    FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
+);
+
 -- 版本快照（复核员按版本回看/比较）：版本真正推进时与版本、结果、锁定
--- 同事务留存该版的配对、未配对记录、总时差与锁定清单，之后不再改变。
--- v0 在创建演练时留存；重传、失败回滚、封存不产生新快照。
+-- 同事务留存该版的配对、未配对记录、总时差、锁定清单与隔离清单，
+-- 之后不再改变。v0 在创建演练时留存；重传、失败回滚、封存不产生新快照。
 CREATE TABLE IF NOT EXISTS snapshots (
     drill_id                  TEXT NOT NULL,
     version                   INTEGER NOT NULL,
@@ -90,6 +101,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     unpaired_json             TEXT NOT NULL,
     total_time_diff_seconds   REAL NOT NULL,
     locks_json                TEXT NOT NULL,
+    quarantine_json           TEXT NOT NULL,
     created_at                 TEXT NOT NULL,
     PRIMARY KEY (drill_id, version),
     FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
@@ -236,6 +248,41 @@ class TransferRecordLockedError(ServiceError):
     error_code = "transfer_record_locked"
 
 
+class QuarantineRecordMissingError(ServiceError):
+    """隔离/恢复批次引用了不存在的记录。"""
+
+    status_code = 404
+    error_code = "quarantine_record_missing"
+
+
+class DuplicateRecordInQuarantineError(ServiceError):
+    """隔离/恢复批次的记录号列表内出现重复。"""
+
+    status_code = 409
+    error_code = "duplicate_record_in_quarantine"
+
+
+class QuarantineRecordLockedError(ServiceError):
+    """隔离/恢复批次涉及人工锁定中的记录（锁定成员不得隔离）。"""
+
+    status_code = 409
+    error_code = "quarantine_record_locked"
+
+
+class LockRecordQuarantinedError(ServiceError):
+    """锁定涉及被隔离的记录（隔离记录不得人工锁定）。"""
+
+    status_code = 409
+    error_code = "lock_record_quarantined"
+
+
+class TransferRecordQuarantinedError(ServiceError):
+    """待迁移记录处于隔离状态，不能跨演练迁移。"""
+
+    status_code = 409
+    error_code = "transfer_record_quarantined"
+
+
 # --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
@@ -264,12 +311,31 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA)
+        # 升级既有库：旧版 snapshots 表补隔离清单列（幂等）。
+        _migrate_legacy_columns(conn)
         # 批量预演校验标识所需的 HMAC 密钥（不存在即生成，随库持久化）。
         _ensure_preview_secret(conn)
         # 升级既有库：从升级时的当前版本开始留存快照；更早的版本不补造。
         _backfill_legacy_snapshots(conn)
     finally:
         conn.close()
+
+
+def _migrate_legacy_columns(conn: sqlite3.Connection) -> None:
+    """既有库升级：为旧版 snapshots 表补充 quarantine_json 列。
+
+    隔离功能上线前留存的快照本就没有隔离状态，列缺省 '[]' 即其真实
+    内容（历史快照保持原貌）；新库由 SCHEMA 直接建出该列，无需迁移。
+    """
+    cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(snapshots)").fetchall()
+    }
+    if "quarantine_json" not in cols:
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN quarantine_json "
+            "TEXT NOT NULL DEFAULT '[]'"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -417,13 +483,16 @@ def _backfill_legacy_snapshots(conn: sqlite3.Connection) -> None:
                 total = res["total_time_diff_seconds"]
                 version = res["version"]
             locks = _lock_items(conn, drill_id)
+            quarantine = _quarantine_items(conn, drill_id)
             conn.execute(
                 "INSERT INTO snapshots (drill_id, version, pairs_json, "
                 "unpaired_json, total_time_diff_seconds, locks_json, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "quarantine_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     drill_id, version, pairs_json, unpaired_json, total,
-                    json.dumps(locks, ensure_ascii=False), now,
+                    json.dumps(locks, ensure_ascii=False),
+                    json.dumps(quarantine, ensure_ascii=False), now,
                 ),
             )
         conn.execute("COMMIT")
@@ -498,6 +567,27 @@ def _load_lock_keys(conn: sqlite3.Connection, drill_id: str) -> list[tuple[str, 
     return [(r["record_a"], r["record_b"]) for r in rows]
 
 
+def _load_quarantine_nos(conn: sqlite3.Connection, drill_id: str) -> set[str]:
+    """当前被隔离的记录号集合。"""
+    rows = conn.execute(
+        "SELECT record_no FROM quarantine WHERE drill_id = ?", (drill_id,)
+    ).fetchall()
+    return {r["record_no"] for r in rows}
+
+
+def _quarantine_items(conn: sqlite3.Connection, drill_id: str) -> list[dict]:
+    """组装隔离清单（按记录号升序）。"""
+    rows = conn.execute(
+        "SELECT record_no, created_at FROM quarantine WHERE drill_id = ? "
+        "ORDER BY record_no",
+        (drill_id,),
+    ).fetchall()
+    return [
+        {"record_no": r["record_no"], "quarantined_at": r["created_at"]}
+        for r in rows
+    ]
+
+
 def _check_lock_candidate(
     record_map: dict[str, Record], allowed_micros: int, a: str, b: str
 ) -> None:
@@ -553,8 +643,9 @@ def _persist_snapshot(
     version: int,
     result: MatchResult,
     locks: list[dict],
+    quarantine: list[dict],
 ) -> None:
-    """在写事务内留存版本快照（配对/未配对/总时差/锁定清单）。
+    """在写事务内留存版本快照（配对/未配对/总时差/锁定清单/隔离清单）。
 
     与版本推进、结果重算在同一事务提交；快照一旦留存不再改变。
     """
@@ -569,8 +660,9 @@ def _persist_snapshot(
     conn.execute(
         """
         INSERT INTO snapshots (drill_id, version, pairs_json, unpaired_json,
-                               total_time_diff_seconds, locks_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+                               total_time_diff_seconds, locks_json,
+                               quarantine_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             drill_id,
@@ -579,6 +671,7 @@ def _persist_snapshot(
             json.dumps(list(result.unpaired), ensure_ascii=False),
             result.total_time_diff_seconds,
             json.dumps(locks, ensure_ascii=False),
+            json.dumps(quarantine, ensure_ascii=False),
             _now_iso(),
         ),
     )
@@ -587,16 +680,19 @@ def _persist_snapshot(
 def _recompute(conn: sqlite3.Connection, drill_id: str) -> None:
     """重算全场配对：版本 +1（调用方负责），结果与版本同事务落库。
 
-    先保留全部锁定对，再对剩余日志按“配对数最多、总时差最小、
-    记录号字典序最小”求解；锁定即使降低全场配对数也不替换。
+    被隔离记录不参与配对、不进入未配对清单；先保留全部锁定对，再对
+    剩余未隔离日志按“配对数最多、总时差最小、记录号字典序最小”求解；
+    锁定即使降低全场配对数也不替换。
     """
     drill = _get_drill_row(conn, drill_id)
     version = drill["version"] + 1
     records = _load_records(conn, drill_id)
+    quarantined = _load_quarantine_nos(conn, drill_id)
+    active = [r for r in records if r.record_no not in quarantined]
     lock_keys = _load_lock_keys(conn, drill_id)
     try:
         result = match_records(
-            records, drill["allowed_diff_secs"], locked_keys=lock_keys
+            active, drill["allowed_diff_secs"], locked_keys=lock_keys
         )
     except InvalidLockError as exc:
         raise LockInvalidatedError(str(exc))
@@ -605,10 +701,15 @@ def _recompute(conn: sqlite3.Connection, drill_id: str) -> None:
         (version, drill_id),
     )
     _persist_result(conn, drill_id, version, result)
-    # 版本真正推进：同事务留存该版快照（含当时锁定清单）。
+    # 版本真正推进：同事务留存该版快照（含当时锁定清单与隔离清单）。
     rmap = _record_map(records)
     _persist_snapshot(
-        conn, drill_id, version, result, _lock_items(conn, drill_id, rmap)
+        conn,
+        drill_id,
+        version,
+        result,
+        _lock_items(conn, drill_id, rmap),
+        _quarantine_items(conn, drill_id),
     )
 
 
@@ -649,7 +750,7 @@ def create_drill(drill_id: str, allowed_diff_secs: float) -> dict:
             empty = MatchResult((), (), 0.0)
             _persist_result(conn, drill_id, 0, empty)
             # 创建演练的 0 版即可回看：同事务留存空场快照。
-            _persist_snapshot(conn, drill_id, 0, empty, [])
+            _persist_snapshot(conn, drill_id, 0, empty, [], [])
         return get_drill(drill_id)
     finally:
         conn.close()
@@ -888,11 +989,17 @@ def preview_batch_logs(drill_id: str, items: Iterable[dict]) -> dict:
             base_version = drill["version"]
             records = _load_records(conn, drill_id)
             lock_keys = _load_lock_keys(conn, drill_id)
+            quarantined = _load_quarantine_nos(conn, drill_id)
 
+            # 预演遵守隔离状态：被隔离记录在拟写入结果中仍不参与配对
+            # （隔离期间更正日志不改变其隔离状态）。
             simulated = _simulate_batch(records, items)
+            active = [
+                r for r in simulated if r.record_no not in quarantined
+            ]
             try:
                 proposed = match_records(
-                    simulated, drill["allowed_diff_secs"],
+                    active, drill["allowed_diff_secs"],
                     locked_keys=lock_keys,
                 )
             except InvalidLockError as exc:
@@ -1081,6 +1188,20 @@ def transfer_logs(
                     "请先解除锁定再迁移"
                 )
 
+            # 被移记录不得处于隔离状态（隔离记录不得跨演练迁移）。
+            quarantined_rows = conn.execute(
+                f"SELECT record_no FROM quarantine WHERE drill_id = ? "
+                f"AND record_no IN ({placeholders})",
+                (source_drill_id, *ordered),
+            ).fetchall()
+            if quarantined_rows:
+                raise TransferRecordQuarantinedError(
+                    "记录处于隔离状态，不能跨演练迁移: "
+                    + ", ".join(
+                        sorted(r["record_no"] for r in quarantined_rows)
+                    )
+                )
+
             # 原字段原样转存（station/counterpart/band/mode/时间均保留入库时
             # 的规范化结果；updated_at 不刷新，保留日志原字段）。
             by_no = {r["record_no"]: r for r in rows}
@@ -1218,6 +1339,15 @@ def lock_pair(drill_id: str, record_a: str, record_b: str) -> dict:
                 # 重复锁定同一对：幂等重传，状态不变、版本不推进。
                 return _lock_action_response(conn, drill_id)
 
+            # 隔离记录不得人工锁定（隔离与锁定互斥）。
+            quarantined = _load_quarantine_nos(conn, drill_id)
+            if a in quarantined or b in quarantined:
+                no = a if a in quarantined else b
+                raise LockRecordQuarantinedError(
+                    f"记录 {no} 处于隔离状态，不能人工锁定，"
+                    "请先恢复再锁定"
+                )
+
             records = _load_records(conn, drill_id)
             rmap = _record_map(records)
             allowed_micros = int(
@@ -1286,6 +1416,148 @@ def list_locks(drill_id: str) -> dict:
         conn.close()
 
 
+# --------------------------------------------------------------------------
+# 争议日志隔离（复核员批量隔离/恢复）
+#
+# 隔离只改变互证资格：不删除日志、不改写原字段。被隔离记录不参与配对、
+# 不进入未配对清单与缺口诊断（诊断候选也仅限未隔离日志），也不计入台站
+# 汇总的日志总数/已配对数/未配对数；隔离期间仍可按原接口更正日志，隔离
+# 状态保留；恢复后按当前日志重新求解。隔离与人工锁定互斥：隔离记录不得
+# 锁定或跨演练迁移，已有锁定成员不得隔离。批次中记录不存在、编号重复、
+# 涉及锁定或演练已封存时整批拒绝、状态不变。仅实际状态变化推进一次版本，
+# 结果与隔离清单同事务写入新版本快照；重复操作不推进版本，历史快照保持
+# 原貌。
+# --------------------------------------------------------------------------
+def _prepare_quarantine_batch(record_nos: Iterable[str]) -> list[str]:
+    """校验批次记录号无重复，返回去重后的请求顺序列表（服务层已 strip）。"""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for no in record_nos:
+        if no in seen:
+            raise DuplicateRecordInQuarantineError(
+                f"隔离/恢复批次内记录号重复: {no}"
+            )
+        seen.add(no)
+        ordered.append(no)
+    return ordered
+
+
+def _check_quarantine_batch(
+    conn: sqlite3.Connection, drill_id: str, ordered: list[str]
+) -> None:
+    """批次记录须全部现存且不涉及人工锁定，否则整批拒绝（状态不变）。"""
+    placeholders = ",".join("?" for _ in ordered)
+    rows = conn.execute(
+        f"SELECT record_no FROM logs WHERE drill_id = ? AND record_no IN "
+        f"({placeholders})",
+        (drill_id, *ordered),
+    ).fetchall()
+    found = {r["record_no"] for r in rows}
+    missing = [no for no in ordered if no not in found]
+    if missing:
+        raise QuarantineRecordMissingError(
+            f"演练 {drill_id} 中记录不存在: " + ", ".join(missing)
+        )
+    lock_params = tuple(v for no in ordered for v in (no, no))
+    locked_rows = conn.execute(
+        "SELECT record_a, record_b FROM locks WHERE drill_id = ? AND ("
+        + " OR ".join(["record_a = ? OR record_b = ?"] * len(ordered))
+        + ")",
+        (drill_id, *lock_params),
+    ).fetchall()
+    if locked_rows:
+        pair = locked_rows[0]
+        raise QuarantineRecordLockedError(
+            f"批次涉及人工锁定中的记录 "
+            f"({pair['record_a']}, {pair['record_b']})，"
+            "请先解除锁定再隔离/恢复"
+        )
+
+
+def _quarantine_action_response(
+    conn: sqlite3.Connection, drill_id: str, affected: list[str]
+) -> dict:
+    """隔离/恢复操作响应：本次实际变化的记录、当前隔离清单与最新结果。"""
+    return {
+        "drill_id": drill_id,
+        "affected_record_nos": affected,
+        "quarantine": _quarantine_items(conn, drill_id),
+        "result": _result_from_conn(conn, drill_id),
+    }
+
+
+def quarantine_logs(drill_id: str, record_nos: Iterable[str]) -> dict:
+    """批量隔离争议日志；批次中已隔离的记录自动跳过（重复操作不推进版本）。
+
+    有实际隔离发生时版本 +1，全场按未隔离日志重算，结果与隔离清单在
+    同一事务写入新版本快照。
+    """
+    ordered = _prepare_quarantine_batch(record_nos)
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            _check_quarantine_batch(conn, drill_id, ordered)
+            current = _load_quarantine_nos(conn, drill_id)
+            affected = [no for no in ordered if no not in current]
+            now = _now_iso()
+            for no in affected:
+                conn.execute(
+                    "INSERT INTO quarantine (drill_id, record_no, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (drill_id, no, now),
+                )
+            if affected:
+                _recompute(conn, drill_id)
+            return _quarantine_action_response(conn, drill_id, affected)
+    finally:
+        conn.close()
+
+
+def restore_logs(drill_id: str, record_nos: Iterable[str]) -> dict:
+    """批量恢复被隔离日志；批次中未隔离的记录自动跳过（重复操作不推进版本）。
+
+    有实际恢复发生时版本 +1，按当前日志重新求解全场互证，结果与隔离
+    清单在同一事务写入新版本快照。
+    """
+    ordered = _prepare_quarantine_batch(record_nos)
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            _check_quarantine_batch(conn, drill_id, ordered)
+            current = _load_quarantine_nos(conn, drill_id)
+            affected = [no for no in ordered if no in current]
+            if affected:
+                placeholders = ",".join("?" for _ in affected)
+                conn.execute(
+                    f"DELETE FROM quarantine WHERE drill_id = ? AND "
+                    f"record_no IN ({placeholders})",
+                    (drill_id, *affected),
+                )
+                _recompute(conn, drill_id)
+            return _quarantine_action_response(conn, drill_id, affected)
+    finally:
+        conn.close()
+
+
+def list_quarantine(drill_id: str) -> dict:
+    """查询隔离清单（按记录号升序）及最新互证结果（只读，封存后仍可查）。"""
+    conn = connect()
+    try:
+        with _read_tx(conn):
+            _get_drill_row(conn, drill_id)  # 未知演练 -> 404
+            return {
+                "drill_id": drill_id,
+                "quarantine": _quarantine_items(conn, drill_id),
+                "result": _result_from_conn(conn, drill_id),
+            }
+    finally:
+        conn.close()
+
+
 def get_drill(drill_id: str) -> dict:
     conn = connect()
     try:
@@ -1321,6 +1593,7 @@ def list_logs(drill_id: str) -> list[dict]:
             "SELECT * FROM logs WHERE drill_id = ? ORDER BY rowid",
             (drill_id,),
         ).fetchall()
+        quarantined = _load_quarantine_nos(conn, drill_id)
         return [
             {
                 "record_no": r["record_no"],
@@ -1330,6 +1603,8 @@ def list_logs(drill_id: str) -> list[dict]:
                 "band": r["band"],
                 "mode": r["mode"],
                 "updated_at": r["updated_at"],
+                # 隔离只改变互证资格，日志本身保留（附加展示字段）。
+                "quarantined": r["record_no"] in quarantined,
             }
             for r in rows
         ]
@@ -1386,7 +1661,13 @@ def get_gap_diagnostics(drill_id: str) -> dict:
             unpaired = (
                 json.loads(row["unpaired_json"]) if row is not None else []
             )
-            records = _load_records(conn, drill_id)
+            # 缺口诊断的候选仅限未隔离日志（被隔离记录也不在未配对清单中）。
+            quarantined = _load_quarantine_nos(conn, drill_id)
+            records = [
+                r
+                for r in _load_records(conn, drill_id)
+                if r.record_no not in quarantined
+            ]
             gaps = diagnose_gaps(
                 records, drill["allowed_diff_secs"], unpaired
             )
@@ -1439,10 +1720,14 @@ def get_station_summary(drill_id: str) -> dict:
                     paired_nos.add(p["record_b"])
                 unpaired_nos = set(json.loads(row["unpaired_json"]))
             records = _load_records(conn, drill_id)
+            quarantined = _load_quarantine_nos(conn, drill_id)
 
         # 结果与日志同事务落库：每条记录必属于已配对/未配对之一。
+        # 被隔离记录不计入台站的日志总数、已配对数与未配对数。
         buckets: dict[str, list[int]] = {}  # 呼号 -> [总数, 已配对, 未配对]
         for r in records:
+            if r.record_no in quarantined:
+                continue
             bucket = buckets.setdefault(r.station, [0, 0, 0])
             bucket[0] += 1
             if r.record_no in paired_nos:
@@ -1483,6 +1768,7 @@ def _snapshot_payload(row: sqlite3.Row, sealed: bool) -> dict:
         "unpaired": json.loads(row["unpaired_json"]),
         "total_time_diff_seconds": row["total_time_diff_seconds"],
         "locks": json.loads(row["locks_json"]),
+        "quarantine": json.loads(row["quarantine_json"]),
         "snapshot_at": row["created_at"],
     }
 
@@ -1574,8 +1860,8 @@ def _unpaired_diff(unpaired_old: list[str], unpaired_new: list[str]) -> dict:
 def _diff_snapshots(
     from_snap: dict, to_snap: dict
 ) -> dict:
-    """比较两个已留存快照：按记录号稳定排序列出配对、未配对、锁定的
-    新增/移除；同一记录对的时差变化单列。
+    """比较两个已留存快照：按记录号稳定排序列出配对、未配对、锁定与隔离
+    清单的新增/移除；同一记录对的时差变化单列。
 
     ``added`` 以 to（新）版本内容为准，``removed`` 以 from（旧）版本为准。
     """
@@ -1588,6 +1874,10 @@ def _diff_snapshots(
     old_lock = {(l["record_a"], l["record_b"]): l for l in locks_old}
     new_lock = {(l["record_a"], l["record_b"]): l for l in locks_new}
 
+    # 隔离清单按记录号身份比较（恢复后再隔离视为同一记录，不重复列入）。
+    quar_old = {q["record_no"]: q for q in from_snap["quarantine"]}
+    quar_new = {q["record_no"]: q for q in to_snap["quarantine"]}
+
     return {
         "drill_id": to_snap["drill_id"],
         "from_version": from_snap["version"],
@@ -1599,6 +1889,10 @@ def _diff_snapshots(
         "locks": {
             "added": [new_lock[k] for k in sorted(set(new_lock) - set(old_lock))],
             "removed": [old_lock[k] for k in sorted(set(old_lock) - set(new_lock))],
+        },
+        "quarantine": {
+            "added": [quar_new[k] for k in sorted(set(quar_new) - set(quar_old))],
+            "removed": [quar_old[k] for k in sorted(set(quar_old) - set(quar_new))],
         },
         "total_time_diff_seconds": {
             "from": from_snap["total_time_diff_seconds"],

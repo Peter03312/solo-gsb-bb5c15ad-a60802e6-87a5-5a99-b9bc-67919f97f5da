@@ -20,6 +20,9 @@ from .schemas import (
     LockListResponse,
     LockRequest,
     LogEntry,
+    QuarantineActionResponse,
+    QuarantineListResponse,
+    QuarantineRequest,
     ResultResponse,
     SnapshotDiffResponse,
     SnapshotListResponse,
@@ -39,11 +42,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
-        "支持版本化更正、并发原子写入、演练封存与按台站汇总配对覆盖率。"
+        "支持版本化更正、并发原子写入、演练封存、按台站汇总配对覆盖率"
+        "与争议日志隔离。"
     ),
     lifespan=lifespan,
 )
@@ -258,6 +262,42 @@ def list_locks(drill_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------
+# 争议日志隔离（复核员批量隔离/恢复）：只改变互证资格，不删除日志；
+# 封存后拒绝隔离/恢复，仍可查询隔离清单
+# --------------------------------------------------------------------------
+@app.put(
+    "/drills/{drill_id}/quarantine",
+    response_model=QuarantineActionResponse,
+    tags=["quarantine"],
+    summary="批量隔离争议日志（重复隔离不推进版本）",
+)
+def quarantine_logs(drill_id: str, payload: QuarantineRequest) -> dict:
+    return database.quarantine_logs(drill_id, payload.record_nos)
+
+
+@app.post(
+    "/drills/{drill_id}/quarantine/restore",
+    response_model=QuarantineActionResponse,
+    tags=["quarantine"],
+    summary="批量恢复被隔离日志（按当前日志重新求解；重复恢复不推进版本）",
+)
+def restore_quarantined_logs(
+    drill_id: str, payload: QuarantineRequest
+) -> dict:
+    return database.restore_logs(drill_id, payload.record_nos)
+
+
+@app.get(
+    "/drills/{drill_id}/quarantine",
+    response_model=QuarantineListResponse,
+    tags=["quarantine"],
+    summary="查询隔离清单（按记录号升序）及最新互证结果",
+)
+def list_quarantine(drill_id: str) -> dict:
+    return database.list_quarantine(drill_id)
+
+
+# --------------------------------------------------------------------------
 # 版本快照（复核员按版本回看/比较）：只读，不改变当前状态
 # --------------------------------------------------------------------------
 @app.get(
@@ -274,7 +314,7 @@ def list_snapshots(drill_id: str) -> dict:
     "/drills/{drill_id}/snapshots/{version}",
     response_model=SnapshotResponse,
     tags=["snapshots"],
-    summary="取回指定版本快照（配对/未配对/总时差/锁定清单）",
+    summary="取回指定版本快照（配对/未配对/总时差/锁定清单/隔离清单）",
 )
 def get_snapshot(drill_id: str, version: int) -> dict:
     return database.get_snapshot(drill_id, version)

@@ -224,6 +224,50 @@ Content-Type: application/json
   "record_nos": ["R1", "R1"]
 }
 
+### 争议日志隔离：批量隔离（只改变互证资格，不删除日志、不改写原字段）
+### 被隔离记录不参与配对、不进入未配对清单/缺口诊断（候选也仅限未隔离
+### 日志）、不计入台站汇总；隔离期间仍可更正日志（状态保留）。
+### 仅实际状态变化推进一次版本，结果与隔离清单同事务写入新版本快照。
+PUT {{host}}/drills/{{drill}}/quarantine
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R4"]
+}
+
+### 重复隔离同一批：已隔离的记录自动跳过，整批无变化则不推进版本
+PUT {{host}}/drills/{{drill}}/quarantine
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R4"]
+}
+
+### 查询隔离清单（按记录号升序）及最新互证结果（只读；封存后仍可查）
+GET {{host}}/drills/{{drill}}/quarantine
+
+### 批量恢复：按当前日志重新求解（含隔离期间的更正）；重复恢复不推进版本
+POST {{host}}/drills/{{drill}}/quarantine/restore
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R4"]
+}
+
+### 拒绝示例（均整批拒绝、状态不变）：
+###   记录不存在（404 quarantine_record_missing）
+###   批次内编号重复（409 duplicate_record_in_quarantine）
+###   涉及人工锁定中的记录（409 quarantine_record_locked）
+###   演练已封存（409 drill_sealed）；记录号列表为空（422）
+### 关联约束：锁定被隔离记录（409 lock_record_quarantined）
+###   迁移被隔离记录（409 transfer_record_quarantined）
+PUT {{host}}/drills/{{drill}}/quarantine
+Content-Type: application/json
+
+{
+  "record_nos": ["R3", "R3"]
+}
+
 ### 版本快照：列出已留存版本号（创建即有 0；升级前旧版本不出现）
 GET {{host}}/drills/{{drill}}/snapshots### 取回指定版本快照（配对/未配对/总时差/锁定清单；未留存版本 404 snapshot_not_found）
 GET {{host}}/drills/{{drill}}/snapshots/0

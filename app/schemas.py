@@ -47,6 +47,19 @@ def aware_time_to_micros(value: datetime) -> int:
 _DRILL_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
 
+def _clean_record_nos(values: list[str]) -> list[str]:
+    """记录号列表统一校验：逐条 strip，拒绝非字符串与空串。"""
+    cleaned: list[str] = []
+    for v in values:
+        if not isinstance(v, str):
+            raise ValueError("记录号必须是字符串")
+        no = v.strip()
+        if not no:
+            raise ValueError("记录号不能为空")
+        cleaned.append(no)
+    return cleaned
+
+
 class CreateDrillRequest(StrictModel):
     drill_id: str = Field(..., description="演练号（唯一）")
     allowed_time_diff_seconds: float = Field(
@@ -160,15 +173,7 @@ class TransferLogsRequest(StrictModel):
     @field_validator("record_nos")
     @classmethod
     def _record_nos(cls, values: list[str]) -> list[str]:
-        cleaned: list[str] = []
-        for v in values:
-            if not isinstance(v, str):
-                raise ValueError("记录号必须是字符串")
-            no = v.strip()
-            if not no:
-                raise ValueError("记录号不能为空")
-            cleaned.append(no)
-        return cleaned
+        return _clean_record_nos(values)
 
 
 class TransferLogsResponse(StrictModel):
@@ -356,10 +361,57 @@ class LockListResponse(StrictModel):
 
 
 # --------------------------------------------------------------------------
+# 争议日志隔离（复核员批量隔离/恢复；只改变互证资格，不删除日志）
+# --------------------------------------------------------------------------
+class QuarantineRequest(StrictModel):
+    """批量隔离/恢复请求体：非空、无重复的记录号列表。"""
+
+    record_nos: list[str] = Field(
+        ...,
+        min_length=1,
+        description="待隔离/恢复的记录号列表（非空、不可重复）",
+    )
+
+    @field_validator("record_nos")
+    @classmethod
+    def _record_nos(cls, values: list[str]) -> list[str]:
+        return _clean_record_nos(values)
+
+
+class QuarantineItem(StrictModel):
+    """一条隔离记录：记录号与隔离时间。"""
+
+    record_no: str
+    quarantined_at: str
+
+
+class QuarantineActionResponse(StrictModel):
+    """隔离/恢复操作响应：本次实际变化的记录、当前隔离清单与最新结果。"""
+
+    drill_id: str
+    affected_record_nos: list[str] = Field(
+        ...,
+        description="本次实际隔离/恢复的记录号（请求顺序；重复操作自动跳过）",
+    )
+    quarantine: list[QuarantineItem] = Field(
+        ..., description="当前完整隔离清单（按记录号升序）"
+    )
+    result: ResultResponse
+
+
+class QuarantineListResponse(StrictModel):
+    """隔离清单查询响应（按记录号升序）。"""
+
+    drill_id: str
+    quarantine: list[QuarantineItem]
+    result: ResultResponse
+
+
+# --------------------------------------------------------------------------
 # 版本快照（复核员按版本回看 / 比较）
 # --------------------------------------------------------------------------
 class SnapshotResponse(StrictModel):
-    """指定版本的留存快照：该版配对、未配对、总时差与锁定清单。"""
+    """指定版本的留存快照：该版配对、未配对、总时差、锁定清单与隔离清单。"""
 
     drill_id: str
     version: int
@@ -368,6 +420,7 @@ class SnapshotResponse(StrictModel):
     unpaired: list[str]
     total_time_diff_seconds: float
     locks: list[LockItem]
+    quarantine: list[QuarantineItem]
     snapshot_at: str
 
 
@@ -403,6 +456,13 @@ class LockDiffSection(StrictModel):
     removed: list[LockItem]
 
 
+class QuarantineDiffSection(StrictModel):
+    """两版间隔离清单的新增/移除（按记录号身份比较，升序）。"""
+
+    added: list[QuarantineItem]
+    removed: list[QuarantineItem]
+
+
 class TotalDiffSection(StrictModel):
     from_: float = Field(..., alias="from")
     to: float
@@ -420,6 +480,7 @@ class SnapshotDiffResponse(StrictModel):
     pairs: PairDiffSection
     unpaired: UnpairedDiffSection
     locks: LockDiffSection
+    quarantine: QuarantineDiffSection
     total_time_diff_seconds: TotalDiffSection
 
 

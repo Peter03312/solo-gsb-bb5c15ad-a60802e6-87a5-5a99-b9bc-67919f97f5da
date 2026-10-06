@@ -355,11 +355,52 @@ class LockListResponse(StrictModel):
     result: ResultResponse
 
 
+class QuarantineItem(StrictModel):
+    """一条处于争议隔离的记录（清单按记录号升序）。"""
+
+    record_no: str
+    quarantined_at: str
+
+
+# --------------------------------------------------------------------------
+# 争议日志隔离（复核员批量隔离/恢复）
+# --------------------------------------------------------------------------
+class QuarantineBatchRequest(StrictModel):
+    """批量隔离/恢复请求体：非空记录号列表（服务端 strip，不可重复）。"""
+
+    record_nos: list[str] = Field(
+        ...,
+        min_length=1,
+        description="批量隔离/恢复的记录号列表（非空、不可重复）",
+    )
+
+    @field_validator("record_nos")
+    @classmethod
+    def _record_nos(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for v in values:
+            if not isinstance(v, str):
+                raise ValueError("记录号必须是字符串")
+            no = v.strip()
+            if not no:
+                raise ValueError("记录号不能为空")
+            cleaned.append(no)
+        return cleaned
+
+
+class QuarantineListResponse(StrictModel):
+    """隔离清单查询/批量操作响应：隔离清单（按记录号升序）与最新互证结果。"""
+
+    drill_id: str
+    quarantines: list[QuarantineItem]
+    result: ResultResponse
+
+
 # --------------------------------------------------------------------------
 # 版本快照（复核员按版本回看 / 比较）
 # --------------------------------------------------------------------------
 class SnapshotResponse(StrictModel):
-    """指定版本的留存快照：该版配对、未配对、总时差与锁定清单。"""
+    """指定版本的留存快照：该版配对、未配对、总时差、锁定与隔离清单。"""
 
     drill_id: str
     version: int
@@ -368,6 +409,7 @@ class SnapshotResponse(StrictModel):
     unpaired: list[str]
     total_time_diff_seconds: float
     locks: list[LockItem]
+    quarantines: list[QuarantineItem] = []
     snapshot_at: str
 
 
@@ -403,6 +445,13 @@ class LockDiffSection(StrictModel):
     removed: list[LockItem]
 
 
+class QuarantineDiffSection(StrictModel):
+    """隔离记录清单在两版间的新增/移除（按记录号升序）。"""
+
+    added: list[QuarantineItem]
+    removed: list[QuarantineItem]
+
+
 class TotalDiffSection(StrictModel):
     from_: float = Field(..., alias="from")
     to: float
@@ -420,6 +469,7 @@ class SnapshotDiffResponse(StrictModel):
     pairs: PairDiffSection
     unpaired: UnpairedDiffSection
     locks: LockDiffSection
+    quarantines: QuarantineDiffSection
     total_time_diff_seconds: TotalDiffSection
 
 

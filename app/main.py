@@ -20,6 +20,8 @@ from .schemas import (
     LockListResponse,
     LockRequest,
     LogEntry,
+    QuarantineBatchRequest,
+    QuarantineListResponse,
     ResultResponse,
     SnapshotDiffResponse,
     SnapshotListResponse,
@@ -39,11 +41,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
-        "支持版本化更正、并发原子写入、演练封存与按台站汇总配对覆盖率。"
+        "支持版本化更正、并发原子写入、演练封存、争议日志隔离与按台站"
+        "汇总配对覆盖率。"
     ),
     lifespan=lifespan,
 )
@@ -255,6 +258,41 @@ def unlock_pair(drill_id: str, payload: LockRequest) -> dict:
 )
 def list_locks(drill_id: str) -> dict:
     return database.list_locks(drill_id)
+
+
+# --------------------------------------------------------------------------
+# 争议日志隔离（复核员批量隔离/恢复）：封存后拒绝；隔离清单封存后仍可查
+# --------------------------------------------------------------------------
+@app.put(
+    "/drills/{drill_id}/quarantines",
+    response_model=QuarantineListResponse,
+    tags=["quarantines"],
+    summary="批量隔离争议日志（仅新增隔离才推进版本；锁定成员/不存在/重复整批拒绝）",
+)
+def quarantine_records(drill_id: str, payload: QuarantineBatchRequest) -> dict:
+    return database.quarantine_records(drill_id, payload.record_nos)
+
+
+@app.post(
+    "/drills/{drill_id}/quarantines/restore",
+    response_model=QuarantineListResponse,
+    tags=["quarantines"],
+    summary="批量恢复争议日志（仅实际恢复才推进版本，恢复后按当前日志重算）",
+)
+def restore_quarantined_records(
+    drill_id: str, payload: QuarantineBatchRequest
+) -> dict:
+    return database.restore_records(drill_id, payload.record_nos)
+
+
+@app.get(
+    "/drills/{drill_id}/quarantines",
+    response_model=QuarantineListResponse,
+    tags=["quarantines"],
+    summary="查询争议隔离清单（按记录号升序）及最新互证结果（封存后仍可查）",
+)
+def list_quarantines(drill_id: str) -> dict:
+    return database.list_quarantines(drill_id)
 
 
 # --------------------------------------------------------------------------

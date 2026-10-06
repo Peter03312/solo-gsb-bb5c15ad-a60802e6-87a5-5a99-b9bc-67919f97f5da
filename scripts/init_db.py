@@ -10,10 +10,12 @@ from app import config, database
 
 
 def main() -> None:
-    print(f"[init] 初始化数据库: {config.database_url()}")
+    print("[init] 初始化数据库: " + config.database_url())
     database.init_db()
-    print("[init] 完成：drills / logs / results / locks / snapshots / meta 表已就绪")
-    print("[init] 既有演练已从当前版本起留存快照（旧版本不补造）")
+    print("[init] 完成：drills / logs / results / locks / quarantines / "
+          "snapshots / meta 表已就绪")
+    print("[init] 既有演练已从当前版本起留存快照（旧版本不补造），"
+          "历史快照表已补隔离清单列")
     print("[init] meta 表已备好批量预演校验标识密钥（无则自动生成）")
 
 

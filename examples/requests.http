@@ -183,6 +183,32 @@ Content-Type: application/json
   "record_b": "R2"
 }
 
+### 争议日志隔离：批量隔离（只改互证资格：不删日志、不改原字段）
+### 隔离记录不参与配对，不进未配对清单/缺口诊断，不计入台站汇总。
+### 记录不存在 404 quarantine_record_missing；批次内重复
+### 409 duplicate_record_in_quarantine_batch；锁定成员
+### 409 quarantine_record_locked；演练已封存 409 drill_sealed；整批拒绝状态不变。
+### 重复隔离已隔离记录幂等，不推进版本；仅实际新增隔离推进一次版本，
+### 结果与隔离清单同事务写入新版本快照。
+PUT {{host}}/drills/{{drill}}/quarantines
+Content-Type: application/json
+
+{
+  "record_nos": ["R3"]
+}
+
+### 查询争议隔离清单（按记录号升序）及最新互证结果（封存后仍可查）
+GET {{host}}/drills/{{drill}}/quarantines
+
+### 批量恢复（恢复后按当前日志重新求解；重复恢复幂等不推进版本）
+### 记录不存在 404 restore_record_missing；批次内重复/已封存同样整批拒绝。
+POST {{host}}/drills/{{drill}}/quarantines/restore
+Content-Type: application/json
+
+{
+  "record_nos": ["R3"]
+}
+
 ### 日志归错演练：跨演练迁移（源演练路径参数；目标演练与记录号在请求体）
 ### 受理条件：两演练均存在且未封存、源≠目标、源记录全存在、
 ###           目标无同号记录、被移记录不参与源演练锁定；

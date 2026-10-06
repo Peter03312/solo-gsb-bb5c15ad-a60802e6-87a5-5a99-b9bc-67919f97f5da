@@ -167,6 +167,46 @@ def main(base_url: str) -> None:
 
     show("查询最终互证结果", *call("GET", f"{base_url}/drills/{drill}/result"))
 
+    # --- 复核员争议日志隔离：批量隔离/恢复，只改互证资格不删日志 ---
+    # 隔离 R3（单边记录）：不参与配对、不进未配对/缺口/台站汇总；
+    # 隔离状态与结果、新版本快照同事务写入。
+    show("批量隔离争议记录 R3（仅互证资格变化，日志不删除）", *call(
+        "PUT", f"{base_url}/drills/{drill}/quarantines",
+        {"record_nos": ["R3"]},
+    ))
+
+    # 重复隔离同一条视为重传：200 且版本不推进
+    show("重复隔离 R3（重传，版本应不变）", *call(
+        "PUT", f"{base_url}/drills/{drill}/quarantines",
+        {"record_nos": ["R3"]},
+    ))
+
+    # 隔离清单按记录号升序，封存后仍可查
+    show("查询争议隔离清单（按记录号升序）", *call(
+        "GET", f"{base_url}/drills/{drill}/quarantines"
+    ))
+
+    # 隔离期间仍可按原接口更正 R3，隔离状态保留
+    show("隔离期间更正 R3（可写，隔离状态保留）", *call(
+        "PUT", f"{base_url}/drills/{drill}/logs/R3",
+        {"record_no": "R3", "station": "BH3CCC", "counterpart": "BH4DDD",
+         "time": "2026-10-04T00:00:02+00:00", "band": "40m", "mode": "SSB"},
+    ))
+
+    # 隔离锁定成员 -> 整批拒绝（这里 R1/R2 已解锁，改用不存在记录演示拒绝）
+    show("隔离不存在的记录（应 404 quarantine_record_missing）", *call(
+        "PUT", f"{base_url}/drills/{drill}/quarantines",
+        {"record_nos": ["NOPE"]},
+    ))
+
+    # 恢复 R3：按当前日志重新全场求解；仅实际恢复才推进版本
+    show("批量恢复 R3（按当前日志重新求解）", *call(
+        "POST", f"{base_url}/drills/{drill}/quarantines/restore",
+        {"record_nos": ["R3"]},
+    ))
+
+    show("查询最终互证结果", *call("GET", f"{base_url}/drills/{drill}/result"))
+
     # --- 复核员缺口诊断：为每条未配对记录按当前日志归因（只读） ---
     show("未配对日志缺口诊断（只读，带当前版本）", *call(
         "GET", f"{base_url}/drills/{drill}/gap-diagnostics"
